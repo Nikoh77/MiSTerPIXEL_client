@@ -39,7 +39,7 @@ import configparser
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, Tuple
 
-CLIENT_VERSION = "0.3.0"
+CLIENT_VERSION = "0.9.0"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
