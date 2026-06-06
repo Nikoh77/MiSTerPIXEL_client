@@ -1,0 +1,13 @@
+# Secrets — never commit (hold API keys)
+pixel.ini
+pixel_default.ini
+pixel_remote.ini
+pixel_token
+pixel.log
+pixel.pid
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/

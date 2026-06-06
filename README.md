@@ -1,0 +1,185 @@
+# MiSTer PIXEL — Client
+
+> **Translate retro game text on your MiSTer FPGA in real time.**
+
+MiSTer PIXEL captures a screenshot from the game core currently running on your [MiSTer FPGA](https://github.com/MiSTer-devel/Main_MiSTer) and sends it to a companion server that performs OCR and translation via a VLM/AI model. The translated text is displayed on your phone or PC — no modification to the MiSTer firmware required.
+
+This repository contains the **client** that runs on the MiSTer. The server component lives in a separate repository.
+
+---
+
+## How it works
+
+```
+MiSTer FPGA                          Your phone / PC
+┌────────────────────────────┐       ┌──────────────────────────┐
+│  pixel.sh (daemon)         │  TCP  │  PIXEL server            │
+│  ┌──────────────────────┐  │──────▶│  ├── OCR                 │
+│  │ Capture screenshot   │  │       │  ├── Translation (VLM)   │
+│  │ (firmware FIFO or    │  │       │  └── Web UI              │
+│  │  /dev/mem fallback)  │  │       └──────────────────────────┘
+│  │ Gather core/ROM info │  │  HTTP long-poll (triggers)
+│  │ Long-poll server     │◀─┘
+│  └──────────────────────┘
+└────────────────────────────┘
+```
+
+1. The daemon registers with the server and displays a short pairing code on the MiSTer Scripts menu.
+2. You open the web UI on your phone/PC, enter the code, and the device is linked.
+3. Tap **Translate now** in the web UI — the daemon captures the current frame and sends it.
+4. The server replies with the translated text, shown instantly in the browser.
+
+---
+
+## Features
+
+- **Two capture methods**
+  - `fifo` *(default)*: asks the MiSTer firmware to take a native PNG screenshot via `/dev/MiSTer_cmd`; automatically falls back to `mem` on timeout
+  - `mem`: reads raw RGB directly from the scaler shared memory (`/dev/mem`)
+- **Zero dependencies**: pure Python 3.9 stdlib — no pip, no virtualenv; can be compiled to a standalone binary with [Nuitka](https://nuitka.net/)
+- **Thin client**: all heavy processing (OCR, colour handling, translation) happens server-side
+- **Single-instance daemon**: replaces any previously running PIXEL client on launch
+- **Remote configuration**: mutable settings (`target_lang`, `source_lang`, `capture_method`, …) can be changed from the web UI without SSH
+- **Secure token auth**: per-device token derived from network MAC addresses; bootstrap keys (server address, API key) are never web-writable
+
+---
+
+## Requirements
+
+- MiSTer FPGA with stock firmware (no third-party add-ons required)
+- Python 3.9 (pre-installed on MiSTer) — *or* the Nuitka-compiled binary
+- A running [MiSTer PIXEL server](https://github.com/Nikoh77/MiSTerPIXEL_server) reachable on the local network
+
+---
+
+## Installation
+
+1. Copy `pixel.sh` and `pixel_default.ini` to your MiSTer (e.g. `/media/fat/Scripts/`):
+
+   ```bash
+   scp pixel.sh pixel_default.ini root@<mister-ip>:/media/fat/Scripts/
+   ```
+
+2. Edit `pixel_default.ini` on the MiSTer with your server address and API key:
+
+   ```ini
+   [pixel]
+   key    = your-api-key
+   server = 192.168.1.10:9999
+   ```
+
+   > **Keep `pixel_default.ini` out of version control** — it contains your API key.
+
+3. Also edit the bootstrap constants at the top of `pixel.sh` to match your server:
+
+   ```bash
+   CONF_SERVER = "192.168.1.10:9999"
+   CONF_WEB_PORT = 8080
+   ```
+
+4. Make the script executable:
+
+   ```bash
+   chmod +x /media/fat/Scripts/pixel.sh
+   ```
+
+---
+
+## Usage
+
+### From the MiSTer Scripts menu
+
+Select **pixel** from the OSD Scripts menu. A pairing code and URL are shown. Open the URL on your phone/PC, enter the code, and the client starts polling in the background.
+
+| Key | Action |
+|-----|--------|
+| Any key | Start / continue |
+| `R` | Restart the daemon |
+| `S` | Stop the daemon |
+
+### Command line (SSH)
+
+```bash
+# Start daemon (default mode)
+./pixel.sh
+
+# Stop a running daemon
+./pixel.sh --stop
+
+# Single capture and send (debug / test)
+./pixel.sh --once -a 192.168.1.10:9999
+
+# Single capture, save locally only
+./pixel.sh --once --save-only -s /tmp/frame.raw
+
+# Override game title
+./pixel.sh --game "Final Fantasy VI"
+
+# Send without zlib compression
+./pixel.sh --once --no-compress -a 192.168.1.10:9999
+```
+
+---
+
+## Configuration
+
+Configuration is split into two files, read in order (later values override earlier ones):
+
+### `pixel_default.ini` *(hand-edited, kept local)*
+
+```ini
+[pixel]
+key                    = your-api-key        ; server API key — never commit this
+server                 = 192.168.1.10:9999   ; host[:port]
+target_lang            = it                  ; translate INTO this language (ISO code)
+source_lang            = auto                ; "auto" = VLM detects the source language
+user_id                = your-user-id
+web_port               = 8080
+capture_method         = fifo                ; "fifo" or "mem"
+delete_screenshot_after = true
+```
+
+### `pixel_remote.ini` *(auto-generated by the web UI)*
+
+Written automatically when you change settings from the browser. Do not edit by hand. Bootstrap keys (`server`, `key`, `web_port`) are never written here.
+
+---
+
+## Runtime files
+
+| File | Description |
+|------|-------------|
+| `pixel_token` | Per-device auth token (issued at pairing time) |
+| `pixel_remote.ini` | Web-managed settings override |
+| `pixel.log` | Daemon log (stdout/stderr after detach) |
+| `pixel.pid` | PID of the running daemon |
+
+---
+
+## Protocol
+
+Frames are sent over a raw TCP connection (little-endian):
+
+```
+[1 B]  protocol_version
+[1 B]  token_length  +  [N B] token (UTF-8)
+[4 B]  metadata_length  +  [M B] JSON metadata
+[4 B]  width  +  [4 B] height
+[4 B]  payload_length  +  [P B] payload
+```
+
+Payload is either **raw RGB zlib-compressed** (`image_encoding = "raw"`) or a **verbatim PNG** (`image_encoding = "png"`). The server decodes according to the `image_encoding` and `compression` fields in the metadata.
+
+Current `PROTOCOL_VERSION = 3`. Bump it (and the matching server constant) for any wire-format change.
+
+---
+
+## Contributing
+
+Pull requests are welcome. Please keep the client dependency-free (stdlib only) and Python 3.9 compatible. Positional-only stdlib calls (e.g. `int.to_bytes`, `os.sysconf`) must remain positional — see the note at the top of `pixel.py`.
+
+---
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE) for details.
