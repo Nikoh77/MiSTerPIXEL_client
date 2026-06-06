@@ -39,13 +39,14 @@ import configparser
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, Tuple
 
+CLIENT_VERSION = "0.3.0"
+
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
 MISTER_SCALER_BUFFERSIZE = 0x1000000  # 16MB
 
 # --- Protocol / client identity --------------------------------------------
 PROTOCOL_VERSION = 3  # bump whenever the wire format changes (server must match)
-CLIENT_VERSION = "0.3.0"
 DEFAULT_PORT = 9999
 
 # ---------------------------------------------------------------------------
@@ -354,7 +355,6 @@ def buildMetadata(cfg: dict, image: CapturedImage) -> dict:
     # its account from the per-device token, so the client can't claim to be a
     # different device/account.
     metadata = {
-        "client_version": CLIENT_VERSION,
         "protocol_version": PROTOCOL_VERSION,
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "core": detectCore(),
@@ -745,6 +745,7 @@ def registerClient(cfg: dict, host: str, web_port: int
     server derives it from our device_id.
     """
     body = {"device_id": detectDeviceId(),
+            "client_version": CLIENT_VERSION,
             "settings": currentRemoteSettings(cfg=cfg)}
     status, data = httpRequest(host=host, port=web_port, method="POST",
                                path="/api/register", body=body)

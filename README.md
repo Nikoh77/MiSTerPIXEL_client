@@ -170,7 +170,7 @@ Frames are sent over a raw TCP connection (little-endian):
 
 Payload is either **raw RGB zlib-compressed** (`image_encoding = "raw"`) or a **verbatim PNG** (`image_encoding = "png"`). The server decodes according to the `image_encoding` and `compression` fields in the metadata.
 
-Current `PROTOCOL_VERSION = 3`. Bump it (and the matching server constant) for any wire-format change.
+The `protocol_version` field must match between client and server. Bump it whenever the wire format changes. Versions are managed via git tags.
 
 ---
 
