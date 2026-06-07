@@ -1,10 +1,9 @@
-# Secrets — never commit (hold API keys)
-pixel.ini
-pixel_default.ini
+# Runtime files — never commit (per-device token + web-managed/local state)
 pixel_remote.ini
 pixel_token
 pixel.log
 pixel.pid
+pixel.version
 
 # Python
 .venv/

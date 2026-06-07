@@ -4,7 +4,7 @@
 # Wraps pixel.py so it can be copy-pasted to the MiSTer and run with no
 # separate .py file. The script body is fed to python on fd 3 (not stdin), so
 # stdin stays connected to the keyboard for the launcher key prompt. Body below
-# is a verbatim copy of pixel.py.
+# is a verbatim copy of pixel.py — regenerate with ./build.sh after editing it.
 export PIXEL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec python3 /dev/fd/3 "$@" 3<< 'PYEOF'
 #!/usr/bin/env python3
@@ -35,11 +35,10 @@ import hashlib
 import asyncio
 import argparse
 import http.client
-import configparser
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, Tuple
 
-CLIENT_VERSION = "0.9.0"
+CLIENT_VERSION = "0.9.1"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
@@ -50,25 +49,24 @@ PROTOCOL_VERSION = 3  # bump whenever the wire format changes (server must match
 DEFAULT_PORT = 9999
 
 # ---------------------------------------------------------------------------
-# User settings — edit these constants before deploying to your MiSTer.
-# pixel_remote.ini (auto-written when settings change from the web UI) overrides
-# these at runtime, but the bootstrap keys (server/web_port) never are.
+# Bootstrap settings — edit these constants before deploying to your MiSTer.
+# server/web_port are the only thing the client truly needs to know. The capture
+# constants are just local fallbacks/defaults (used by --once): in daemon mode
+# the authoritative per-device capture settings arrive with each trigger from the
+# server. Translation language lives server-side too (set it from the web Devices
+# tab), so the client never sends it. No config file is written on the device.
 # ---------------------------------------------------------------------------
 CONF_SERVER = "192.168.1.5"          # server as host[:port], e.g. "192.168.1.10:9999"
-CONF_TARGET_LANG             = "it"          # translate INTO this language (ISO code)
-CONF_SOURCE_LANG             = "auto"        # source language; "auto" = let the VLM detect
 CONF_WEB_PORT                = 8080          # web UI port on the server
-CONF_CAPTURE_METHOD          = "fifo"        # "fifo" (firmware PNG) or "mem" (raw /dev/mem)
-CONF_DELETE_SCREENSHOT_AFTER = True          # delete firmware PNG after sending
+CONF_CAPTURE_METHOD          = "fifo"        # fallback "fifo" (firmware PNG) or "mem" (raw /dev/mem)
+CONF_DELETE_SCREENSHOT_AFTER = True          # fallback: delete firmware PNG after sending
 
 # --- Local files -----------------------------------------------------------
-# pixel_remote.ini is written automatically when the user changes settings from
-# the web UI and OVERRIDES the built-in constants above (except the bootstrap
-# keys server/web_port). No other config file is needed: bootstrap settings
-# live here.
-CONFIG_REMOTE_FILENAME = "pixel_remote.ini"
-# The per-device auth token, issued by the server at link time and stored on its
-# own (so a web settings push, which rewrites pixel_remote.ini, can't erase it).
+# The client persists NO config file: bootstrap lives in the CONF_* constants
+# above, and per-device settings (language, capture method, delete-after) live
+# server-side — the capture ones arrive with each trigger (see runDaemon). The
+# only file written is the per-device auth token below.
+# The per-device auth token, issued by the server at link time, stored on its own.
 # It's the credential for the TCP frame channel and the /api/wait poll.
 TOKEN_FILENAME = "pixel_token"
 # Where the detached daemon writes its log (the launcher terminal is gone by
@@ -77,6 +75,13 @@ LOG_FILENAME = "pixel.log"
 # Records the running daemon's PID so a later launch replaces it instead of
 # stacking another poll loop on the MiSTer (single-instance guard).
 PIDFILE_NAME = "pixel.pid"
+# The daemon also records its CLIENT_VERSION next to the PID, so a later launch
+# from an updated pixel.sh can tell an OUTDATED daemon apart and replace it even
+# when it's linked and otherwise healthy. Without this, a deployed code change
+# (e.g. the move to trigger-carried capture settings) silently never takes effect
+# because launch() leaves a working linked daemon running. A missing file means a
+# pre-versioning daemon → treated as outdated.
+VERSIONFILE_NAME = "pixel.version"
 # Current core name written by MiSTer (reliable). Verified in user_io.cpp.
 CORENAME_PATH = "/tmp/CORENAME"
 # The Main binary does NOT write the loaded game's name/path anywhere under
@@ -125,9 +130,7 @@ def defaultConfig() -> dict:
     """Return a fresh cfg dict built from the built-in user constants (CONF_*)."""
     return {
         "server":                  CONF_SERVER,
-        "target_lang":             CONF_TARGET_LANG,
-        "source_lang":             CONF_SOURCE_LANG,
-        "game":                    None,
+        "game":                    None,    # manual title override (--game only)
         "web_port":                CONF_WEB_PORT,
         "capture_method":          CONF_CAPTURE_METHOD,
         "delete_screenshot_after": CONF_DELETE_SCREENSHOT_AFTER,
@@ -135,54 +138,16 @@ def defaultConfig() -> dict:
     }
 
 
-def applyConfigSection(cfg: dict, sec) -> None:
-    """Overlay a parsed [pixel] section (from pixel_remote.ini) onto cfg in place.
-
-    Only keys present in the section are touched, so a partial file overrides
-    exactly those and leaves the rest at their CONF_* defaults. The bootstrap
-    keys (key/server/web_port) are deliberately NOT read here: a web-written
-    remote file can never change them, so the client can't be locked out.
-    """
-    if "target_lang" in sec:
-        cfg["target_lang"] = sec.get("target_lang") or "it"
-    if "source_lang" in sec:
-        cfg["source_lang"] = sec.get("source_lang") or "auto"
-    if "game" in sec:
-        cfg["game"] = sec.get("game") or None
-    if "capture_method" in sec:
-        method = (sec.get("capture_method") or "fifo").strip().lower()
-        cfg["capture_method"] = method if method in ("fifo", "mem") else "fifo"
-    if "delete_screenshot_after" in sec:
-        # getboolean is forgiving (yes/no/true/false/1/0).
-        try:
-            cfg["delete_screenshot_after"] = sec.getboolean("delete_screenshot_after")
-        except ValueError:
-            pass
-
-
 def loadConfig(scriptDir: str) -> dict:
-    """Load configuration: built-in constants (CONF_*) overlaid by pixel_remote.ini.
+    """Build the runtime config: the CONF_* constants plus the stored token.
 
-    The bootstrap settings (key, server, web_port, ...) are embedded as CONF_*
-    constants at the top of this file — edit them before deploying. pixel_remote.ini
-    is written automatically when the user changes settings from the web UI and
-    overrides those constants at runtime (bootstrap keys are never overridden).
+    There is no config file to read. Bootstrap (server/web_port) and the local
+    capture defaults are the CONF_* constants at the top of this file; the
+    authoritative per-device capture settings arrive with each trigger over
+    /api/wait (the CONF_* values are only fallbacks, used by --once). The
+    per-device token lives in its own file.
     """
     cfg = defaultConfig()
-
-    # Overlay remote (web-managed) settings; bootstrap keys are never read here.
-    remote_path = os.path.join(scriptDir, CONFIG_REMOTE_FILENAME)
-    if os.path.exists(path=remote_path):
-        parser = configparser.ConfigParser()
-        try:
-            parser.read(filenames=remote_path)
-            if parser.has_section(section="pixel"):
-                applyConfigSection(cfg=cfg, sec=parser["pixel"])
-        except configparser.Error as e:
-            print(f"Ignoring malformed {CONFIG_REMOTE_FILENAME}: {e}")
-
-    # The per-device token lives in its own file (kept out of the web-managed
-    # remote config, so a settings push can't erase it).
     cfg["token"] = loadToken(scriptDir=scriptDir)
     return cfg
 
@@ -218,46 +183,9 @@ def deleteToken(scriptDir: str) -> None:
         pass
 
 
-# Settings the web UI is allowed to change (the bootstrap keys server/web_port
-# and the per-device token are never web-writable).
-REMOTE_WRITABLE_KEYS = ("target_lang", "source_lang", "game",
-                        "capture_method", "delete_screenshot_after")
-
-
-def writeRemoteConfig(scriptDir: str, settings: dict) -> bool:
-    """Write web-managed settings to pixel_remote.ini. Returns True on success.
-
-    Only keys in REMOTE_WRITABLE_KEYS are persisted (bootstrap secrets are
-    rejected, so the web can never lock the client out). The whole [pixel]
-    section is rewritten from the given settings. Best-effort with error
-    handling: on any I/O failure the existing file is left untouched.
-    """
-    parser = configparser.ConfigParser()
-    parser.add_section(section="pixel")
-    wrote_any = False
-    for name in REMOTE_WRITABLE_KEYS:
-        if name not in settings:
-            continue
-        value = settings[name]
-        if value is None:
-            continue
-        if isinstance(value, bool):
-            value = "true" if value else "false"
-        parser.set("pixel", name, str(value))
-        wrote_any = True
-    if not wrote_any:
-        return False
-    path = os.path.join(scriptDir, CONFIG_REMOTE_FILENAME)
-    tmp_path = path + ".tmp"
-    try:
-        # Write to a temp file then rename, so a crash can't leave a half file.
-        with open(file=tmp_path, mode="w") as f:
-            parser.write(fp=f)
-        os.replace(tmp_path, path)
-    except OSError as e:
-        print(f"Could not write {CONFIG_REMOTE_FILENAME}: {e}")
-        return False
-    return True
+# Capture settings (capture_method, delete_screenshot_after) are web-controlled
+# per device and NOT persisted here: the server stores them and sends them with
+# each trigger (applied in runDaemon).
 
 
 def readFirstLine(path: str) -> Optional[str]:
@@ -354,12 +282,12 @@ def buildMetadata(cfg: dict, image: CapturedImage) -> dict:
     # No identity is sent in the frame: the server resolves both the device and
     # its account from the per-device token, so the client can't claim to be a
     # different device/account.
+    # Translation language is intentionally absent: the server holds it per
+    # device (resolved from our token), so it's authoritative and we don't echo it.
     metadata = {
         "protocol_version": PROTOCOL_VERSION,
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "core": detectCore(),
-        "source_lang": cfg["source_lang"],
-        "target_lang": cfg["target_lang"],
         "image_encoding": image.encoding,
     }
     if image.encoding == "raw":
@@ -726,27 +654,17 @@ def httpRequest(host: str, port: int, method: str, path: str,
         conn.close()
 
 
-def currentRemoteSettings(cfg: dict) -> dict:
-    """The subset of cfg the user may manage from the web (current values).
-
-    Sent to the server at registration so the web Settings form shows what the
-    client is actually using right now.
-    """
-    return {name: cfg[name] for name in REMOTE_WRITABLE_KEYS if name in cfg}
-
-
 def registerClient(cfg: dict, host: str, web_port: int
                    ) -> tuple:  # (code: Optional[str], new_device: bool)
     """Register this client with the server; return (code, new_device).
 
-    The server generates the code and stores it bound to our device_id. We send
-    the current web-managed settings so the Settings tab on the web UI reflects
-    the live config. The account is never sent or stored client-side — the
-    server derives it from our device_id.
+    The server generates the code and stores it bound to our device_id. No
+    settings are sent: they're server-authoritative per device (capture ones
+    arrive with each trigger). The account is never sent or stored client-side —
+    the server derives it from our device_id.
     """
     body = {"device_id": detectDeviceId(),
-            "client_version": CLIENT_VERSION,
-            "settings": currentRemoteSettings(cfg=cfg)}
+            "client_version": CLIENT_VERSION}
     status, data = httpRequest(host=host, port=web_port, method="POST",
                                path="/api/register", body=body)
     if status == 200 and data.get("code"):
@@ -852,6 +770,40 @@ def removeDaemonPid(scriptDir: str) -> None:
         pass
 
 
+def _versionfilePath(scriptDir: str) -> str:
+    return os.path.join(scriptDir, VERSIONFILE_NAME)
+
+
+def readDaemonVersion(scriptDir: str) -> Optional[str]:
+    """Return the CLIENT_VERSION the running daemon recorded, or None.
+
+    None = a pre-versioning daemon (started before this file existed) or none at
+    all; launch() treats that as outdated so an update always replaces it.
+    """
+    try:
+        with open(file=_versionfilePath(scriptDir), mode="r") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def writeDaemonVersion(scriptDir: str) -> None:
+    """Record this daemon's CLIENT_VERSION next to its PID (update detection)."""
+    try:
+        with open(file=_versionfilePath(scriptDir), mode="w") as f:
+            f.write(CLIENT_VERSION)
+    except OSError as e:
+        print(f"Could not write {VERSIONFILE_NAME}: {e}", flush=True)
+
+
+def removeDaemonVersion(scriptDir: str) -> None:
+    """Delete the version file (on graceful shutdown). Best-effort, never raises."""
+    try:
+        os.remove(_versionfilePath(scriptDir))
+    except OSError:
+        pass
+
+
 def _pidAlive(pid: int) -> bool:
     """True if the process exists (signal 0 is a liveness probe, sends nothing)."""
     try:
@@ -924,14 +876,15 @@ def isDaemonRunning(scriptDir: str) -> bool:
 
 
 def installShutdownHandler(scriptDir: str) -> None:
-    """Make the daemon remove its PID file and exit cleanly on SIGTERM/SIGINT.
+    """Make the daemon remove its PID/version files and exit cleanly on SIGTERM/SIGINT.
 
-    So a replace/stop leaves no stale PID file behind, and termination is graceful
+    So a replace/stop leaves no stale PID/version file behind, and termination is graceful
     (the process is almost always blocked in the long-poll, where the signal
     interrupts the syscall and runs this handler immediately).
     """
     def handler(signum, frame):
         removeDaemonPid(scriptDir=scriptDir)
+        removeDaemonVersion(scriptDir=scriptDir)
         os._exit(0)
     signal.signal(signal.SIGTERM, handler)
     signal.signal(signal.SIGINT, handler)
@@ -992,7 +945,8 @@ def runAsDaemon(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: i
     """
     daemonize(scriptDir=scriptDir)
     writeDaemonPid(scriptDir=scriptDir)          # record the detached child's PID
-    installShutdownHandler(scriptDir=scriptDir)  # clean exit + remove PID file
+    writeDaemonVersion(scriptDir=scriptDir)      # ...and its version (update detection)
+    installShutdownHandler(scriptDir=scriptDir)  # clean exit + remove PID/version files
     print(f"[{datetime.now().isoformat()}] PIXEL daemon started (code {code}).",
           flush=True)
     daemonLoop(cfg=cfg, scriptDir=scriptDir, host=host, tcp_port=tcp_port,
@@ -1004,12 +958,14 @@ def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
            compress: bool = True) -> int:
     """Scripts-menu entry: register, show the code, wait for a keypress, then act.
 
-    A running daemon is NOT restarted by default (wasteful) — it's left alone.
-    At the prompt the user can press R to restart it, S to stop it, or any other
-    key to proceed. On proceed: start the daemon if none is running; if one is
-    running and linked, leave it (it uses its token, not the code); if one is
-    running but still pairing, restart it so it picks up the fresh code it needs
-    to fetch its token.
+    A running daemon on the CURRENT version is NOT restarted by default (wasteful)
+    — it's left alone. At the prompt the user can press R to restart it, S to stop
+    it, or any other key to proceed. On proceed: start the daemon if none is
+    running; if one is running, linked AND on this CLIENT_VERSION, leave it (it
+    uses its token, not the code); if it's still pairing OR an OUTDATED build
+    (different/missing recorded version, e.g. after a pixel.sh update), replace it
+    so the new code actually takes effect — this is what makes a deployed update
+    reach the long-poll, not a wasteful restart.
     """
     running = isDaemonRunning(scriptDir=scriptDir)
     linked = bool(cfg.get("token"))
@@ -1025,6 +981,7 @@ def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
     if running and choice == "s":
         stopExistingDaemon(scriptDir=scriptDir)
         removeDaemonPid(scriptDir=scriptDir)
+        removeDaemonVersion(scriptDir=scriptDir)
         print("PIXEL daemon stopped.")
         return 0
     if running and choice == "r":
@@ -1033,12 +990,19 @@ def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
         running = False  # fall through and become the new daemon
 
     if running:
-        if linked:
-            # Working linked daemon: leave it running (no wasteful restart).
+        running_version = readDaemonVersion(scriptDir=scriptDir)
+        if linked and running_version == CLIENT_VERSION:
+            # Working linked daemon on the current build: leave it (no wasteful
+            # restart). Its token, not the code, keeps it authenticated.
             print("PIXEL is already running — left active.")
             return 0
-        # Unlinked daemon mid-pairing: restart so the fresh code above is the one
-        # it will use to fetch its token once linked.
+        # Either mid-pairing (needs the fresh code to fetch its token), or an
+        # OUTDATED build (different/missing recorded version after a pixel.sh
+        # update): replace it so the new code runs. This is the path that makes a
+        # deployed change — e.g. trigger-carried capture settings — actually apply.
+        if linked and running_version != CLIENT_VERSION:
+            print(f"Updating the running PIXEL client "
+                  f"({running_version or 'pre-versioning'} -> {CLIENT_VERSION})...")
         stopExistingDaemon(scriptDir=scriptDir)
 
     return runAsDaemon(cfg=cfg, scriptDir=scriptDir, host=host, tcp_port=tcp_port,
@@ -1121,14 +1085,16 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
             cfg = loadConfig(scriptDir=scriptDir)
             continue
 
-        new_settings = data.get("settings")
-        if new_settings:
-            if writeRemoteConfig(scriptDir=scriptDir, settings=new_settings):
-                cfg = loadConfig(scriptDir=scriptDir)  # token preserved (separate file)
-                print(f"Applied settings from web: {new_settings}", flush=True)
-
         if not data.get("triggered"):
-            continue  # timed out / settings-only update; poll again
+            continue  # timed out; poll again
+
+        # The trigger carries this device's capture instructions (server-
+        # authoritative, per device), so a web change applies on the very next
+        # trigger. Fall back to the CONF_* defaults if a field is absent.
+        if data.get("capture_method"):
+            cfg["capture_method"] = data["capture_method"]
+        if "delete_screenshot_after" in data:
+            cfg["delete_screenshot_after"] = bool(data["delete_screenshot_after"])
 
         print("Trigger received — capturing...", flush=True)
         try:
@@ -1173,7 +1139,8 @@ if __name__ == "__main__":
     # shutdown (SIGTERM->SIGKILL escalation) for a 'Stop PIXEL' Scripts entry.
     if args.stop:
         stopped = stopExistingDaemon(scriptDir=scriptDir)
-        removeDaemonPid(scriptDir=scriptDir)  # clear any stale PID file too
+        removeDaemonPid(scriptDir=scriptDir)      # clear any stale PID file too
+        removeDaemonVersion(scriptDir=scriptDir)  # ...and the version marker
         print("PIXEL daemon stopped." if stopped else "No running PIXEL daemon found.")
         sys.exit(0)
 
