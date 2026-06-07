@@ -25,11 +25,12 @@ import signal
 import hashlib
 import asyncio
 import argparse
+import subprocess
 import http.client
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, Tuple
 
-CLIENT_VERSION = "0.9.1"
+CLIENT_VERSION = "0.9.2"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
@@ -645,6 +646,106 @@ def httpRequest(host: str, port: int, method: str, path: str,
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Self-update: the web area arms it, the server delivers {version,url,sha256}
+# over /api/wait, and we fetch the new pixel.sh over HTTPS, verify it, swap it
+# in and relaunch. The actual code comes from GitHub over TLS (not our plain-HTTP
+# server), and the sha256 (computed server-side from the same source) is checked
+# before anything is written — a tampered/corrupt download is refused, the old
+# build kept. Running as root, this is a code-execution channel, so verification
+# is mandatory, not optional.
+# ---------------------------------------------------------------------------
+def downloadHttps(url: str, timeout: float = 60.0, _redirects: int = 3) -> Optional[bytes]:
+    """GET an HTTPS URL (stdlib http.client) and return the body, or None.
+
+    HTTPS only — the update artifact must arrive over TLS so it can't be swapped
+    in transit; an http:// URL is refused. Follows a few redirects (raw GitHub
+    may 302 to a CDN). Returns None on any error rather than raising.
+    """
+    from urllib.parse import urlsplit  # stdlib; parse host/path only
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        print(f"Refusing non-HTTPS update URL: {url}", flush=True)
+        return None
+    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
+    path = parts.path + (f"?{parts.query}" if parts.query else "")
+    try:
+        conn.request("GET", path or "/", headers={"User-Agent": "MiSTerPIXEL-client"})
+        resp = conn.getresponse()
+        if resp.status in (301, 302, 303, 307, 308) and _redirects > 0:
+            loc = resp.getheader("Location")
+            resp.read()
+            if not loc:
+                return None
+            if loc.startswith("/"):
+                loc = f"https://{parts.hostname}{loc}"
+            return downloadHttps(url=loc, timeout=timeout, _redirects=_redirects - 1)
+        if resp.status != 200:
+            print(f"Update download HTTP {resp.status} for {url}", flush=True)
+            return None
+        return resp.read()
+    except Exception as e:
+        print(f"Update download error: {e}", flush=True)
+        return None
+    finally:
+        conn.close()
+
+
+def applyUpdate(scriptDir: str, host: str, tcp_port: int, version: str,
+                url: str, sha256_expected: str) -> None:
+    """Install a new pixel.sh and relaunch. Best-effort, never raises.
+
+    Downloads over HTTPS, verifies the sha256, atomically replaces pixel.sh
+    (keeping a .bak), then spawns the new pixel.sh detached: its launch() sees
+    THIS still-running daemon on a different recorded version and replaces it via
+    the single-instance + version-mismatch path — so the new code takes over with
+    no manual restart. Any failure leaves the running build untouched.
+    """
+    target = os.path.join(scriptDir, "pixel.sh")
+    print(f"[update] requested -> {version}; downloading {url}", flush=True)
+    data = downloadHttps(url=url)
+    if data is None:
+        print("[update] aborted: download failed.", flush=True)
+        return
+    got = hashlib.sha256(data).hexdigest()
+    if got != (sha256_expected or "").lower():
+        print(f"[update] aborted: sha256 mismatch "
+              f"(expected {sha256_expected}, got {got}).", flush=True)
+        return
+
+    tmp = target + ".new"
+    bak = target + ".bak"
+    try:
+        with open(file=tmp, mode="wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o755)
+        try:  # one-deep backup for manual rollback (best-effort)
+            if os.path.exists(target):
+                with open(file=target, mode="rb") as src, open(file=bak, mode="wb") as dst:
+                    dst.write(src.read())
+        except OSError:
+            pass
+        os.replace(tmp, target)  # atomic on the same filesystem
+    except OSError as e:
+        print(f"[update] aborted: could not install pixel.sh: {e}", flush=True)
+        try: os.remove(tmp)
+        except OSError: pass
+        return
+
+    print(f"[update] installed {version}; relaunching new daemon...", flush=True)
+    try:
+        # Detached: survives this daemon's imminent SIGTERM (the new launch()
+        # stops us). -a makes it self-sufficient; CONF_* in the new file cover
+        # the rest. keyPrompt() returns 'enter' with no tty, so it proceeds.
+        subprocess.Popen([target, "-a", f"{host}:{tcp_port}"],
+                         stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True)
+    except OSError as e:
+        print(f"[update] installed but relaunch failed: {e}. "
+              f"Restart PIXEL from the MiSTer menu to finish.", flush=True)
+
+
 def registerClient(cfg: dict, host: str, web_port: int
                    ) -> tuple:  # (code: Optional[str], new_device: bool)
     """Register this client with the server; return (code, new_device).
@@ -1074,6 +1175,16 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
                   flush=True)
             deleteToken(scriptDir=scriptDir)
             cfg = loadConfig(scriptDir=scriptDir)
+            continue
+
+        # Self-update (web-armed) takes priority over a capture. applyUpdate swaps
+        # pixel.sh and spawns the new daemon, which SIGTERMs us; if it returns,
+        # the update was refused/failed and we just keep polling on the old build.
+        upd = data.get("update")
+        if upd:
+            applyUpdate(scriptDir=scriptDir, host=host, tcp_port=tcp_port,
+                        version=upd.get("version", "?"), url=upd.get("url", ""),
+                        sha256_expected=upd.get("sha256", ""))
             continue
 
         if not data.get("triggered"):
