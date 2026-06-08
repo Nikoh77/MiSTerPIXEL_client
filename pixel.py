@@ -30,7 +30,7 @@ import http.client
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, Tuple
 
-CLIENT_VERSION = "0.9.3"
+CLIENT_VERSION = "0.9.4"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000

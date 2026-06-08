@@ -3,9 +3,9 @@
 **Translate retro game text on your MiSTer FPGA in real time.**
 
 > Almost all of the code was written by AI — not because I couldn’t write it myself or because I particularly enjoy using these tools, but simply because it would have taken time I didn’t have. Otherwise, this module wouldn’t exist at all.
-
+>
 > Basically, without AI I wouldn’t have had the time to develop it the old-school way, especially since I’m not a JavaScript developer (the server this client connects to) and it would’ve taken me a bit longer…
-
+>
 > That said, the structure, organization, integrations, and the setup for future development were all guided by me — as well as, of course, all the features it currently has.
 
 MiSTer PIXEL captures a screenshot from the game core currently running on your [MiSTer FPGA](https://github.com/MiSTer-devel/Main_MiSTer) and sends it to a companion server that performs OCR and translation via a VLM/AI model. The translated text is displayed on your phone or PC — no modification to the MiSTer firmware required.
