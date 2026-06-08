@@ -26,7 +26,7 @@ fi
   cat <<'HEADER'
 #!/bin/bash
 # PIXEL - MiSTer FPGA frame capture client
-# Usage: ./pixel.sh [-a HOST:PORT] [-s out.raw] [--game TITLE] [--no-compress] [--once] [--stop]
+# Usage: ./pixel.sh [-a HOST:PORT] [--restart] [--stop]
 # Wraps pixel.py so it can be copy-pasted to the MiSTer and run with no
 # separate .py file. The script body is fed to python on fd 3 (not stdin), so
 # stdin stays connected to the keyboard for the launcher key prompt. Body below

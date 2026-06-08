@@ -1,0 +1,46 @@
+name: Build pixel.sh
+
+# Keep the deployed artifact (pixel.sh) in sync with its source (pixel.py).
+# pixel.sh is a verbatim copy of pixel.py wrapped in a tiny bash launcher; the
+# client self-update fetches it from raw.githubusercontent at a tag, so it MUST
+# match pixel.py in the repo. Rather than rely on the developer running
+# ./build.sh, regenerate it here and commit it back on every push that touches
+# the source.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - pixel.py
+      - build.sh
+      - .github/workflows/build-pixel-sh.yml
+
+permissions:
+  contents: write          # needed to push the regenerated pixel.sh
+
+concurrency:
+  group: build-pixel-sh-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Regenerate pixel.sh from pixel.py
+        run: bash build.sh
+
+      - name: Commit pixel.sh if it changed
+        run: |
+          if git diff --quiet -- pixel.sh; then
+            echo "pixel.sh already in sync — nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pixel.sh
+          # [skip ci] + the paths filter (pixel.sh isn't a trigger path) + the
+          # GITHUB_TOKEN recursion guard all prevent this commit re-triggering us.
+          git commit -m "ci: regenerate pixel.sh from pixel.py [skip ci]"
+          git push

@@ -43,10 +43,10 @@ DEFAULT_PORT = 9999
 # ---------------------------------------------------------------------------
 # Bootstrap settings — edit these constants before deploying to your MiSTer.
 # server/web_port are the only thing the client truly needs to know. The capture
-# constants are just local fallbacks/defaults (used by --once): in daemon mode
-# the authoritative per-device capture settings arrive with each trigger from the
-# server. Translation language lives server-side too (set it from the web Devices
-# tab), so the client never sends it. No config file is written on the device.
+# constants are just the initial local defaults: in daemon mode the authoritative
+# per-device capture settings arrive with each trigger from the server.
+# Translation language lives server-side too (set it from the web Devices tab), so
+# the client never sends it. No config file is written on the device.
 # ---------------------------------------------------------------------------
 CONF_SERVER = "192.168.1.5"          # server as host[:port], e.g. "192.168.1.10:9999"
 CONF_WEB_PORT                = 8080          # web UI port on the server
@@ -122,7 +122,6 @@ def defaultConfig() -> dict:
     """Return a fresh cfg dict built from the built-in user constants (CONF_*)."""
     return {
         "server":                  CONF_SERVER,
-        "game":                    None,    # manual title override (--game only)
         "web_port":                CONF_WEB_PORT,
         "capture_method":          CONF_CAPTURE_METHOD,
         "delete_screenshot_after": CONF_DELETE_SCREENSHOT_AFTER,
@@ -136,7 +135,7 @@ def loadConfig(scriptDir: str) -> dict:
     There is no config file to read. Bootstrap (server/web_port) and the local
     capture defaults are the CONF_* constants at the top of this file; the
     authoritative per-device capture settings arrive with each trigger over
-    /api/wait (the CONF_* values are only fallbacks, used by --once). The
+    /api/wait (the CONF_* values are only the initial local defaults). The
     per-device token lives in its own file.
     """
     cfg = defaultConfig()
@@ -225,16 +224,6 @@ def parseGameId() -> dict:
     return info
 
 
-def detectGame(override: Optional[str]) -> Optional[str]:
-    """Return an explicit human-readable game title, if provided.
-
-    Only honors --game / CONF_GAME: stock MiSTer exposes no readable title
-    (see parseGameId). Without an override this returns None and the server
-    resolves a canonical name from rom_crc32/rom_serial via its offline DB.
-    """
-    return override
-
-
 def detectDeviceId() -> Optional[str]:
     """Derive a stable identifier unique to this MiSTer.
 
@@ -285,13 +274,9 @@ def buildMetadata(cfg: dict, image: CapturedImage) -> dict:
     if image.encoding == "raw":
         metadata["pixel_format"] = "RGB"
         metadata["bytes_per_pixel"] = 3
-    # Only include a manual title override when one is set (--game / CONF_GAME);
-    # stock MiSTer has no readable title, so the server resolves it from the CRC.
-    game = detectGame(override=cfg["game"])
-    if game:
-        metadata["game"] = game
     # Precise ROM identifiers (CRC32/Serial) when available, for server-side
-    # game lookup. Absent unless log_file_entry=1 is set in MiSTer.ini.
+    # game lookup (stock MiSTer exposes no readable title). Absent unless
+    # log_file_entry=1 is set in MiSTer.ini.
     metadata.update(gameid)
     return metadata
 
@@ -495,30 +480,8 @@ def cleanupScreenshot(cfg: dict, image: CapturedImage) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Output: save / send
+# Output: send to the server
 # ---------------------------------------------------------------------------
-def saveCapture(image: CapturedImage, filepath: str, metadata: dict) -> bool:
-    """Save the captured image to disk, plus a '<filepath>.json' metadata sidecar.
-
-    A PNG capture is written verbatim. A raw capture uses the legacy layout:
-    width (4 B LE) + height (4 B LE) + RGB pixel data (so Misc/raw2jpg.py reads it).
-    """
-    try:
-        with open(file=filepath, mode="wb") as f:
-            if image.encoding == "raw":
-                # 3.9: int.to_bytes args are positional-only (keywords in 3.11)
-                f.write(image.width.to_bytes(4, "little"))
-                f.write(image.height.to_bytes(4, "little"))
-            f.write(image.data)
-        with open(file=filepath + ".json", mode="w") as f:
-            json.dump(obj=metadata, fp=f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Error saving file: {e}")
-        return False
-    print(f"Saved to: {filepath} (+ .json)")
-    return True
-
-
 async def sendImage(cfg: dict, host: str, port: int, image: CapturedImage,
                     metadata: dict, compress: bool = True) -> bool:
     """Send the captured image + context to the server and print its response.
@@ -1028,7 +991,7 @@ def printReady(host: str, web_port: int, code: str, new_device: bool,
 
 
 def runAsDaemon(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
-                code: str, compress: bool = True) -> int:
+                code: str) -> int:
     """Detach into the background and run the poll loop (become THE daemon).
 
     The parent exits so the MiSTer Scripts menu returns to the OSD; the detached
@@ -1042,12 +1005,12 @@ def runAsDaemon(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: i
     print(f"[{datetime.now().isoformat()}] PIXEL daemon started (code {code}).",
           flush=True)
     daemonLoop(cfg=cfg, scriptDir=scriptDir, host=host, tcp_port=tcp_port,
-               web_port=web_port, code=code, compress=compress)
+               web_port=web_port, code=code)
     return 0
 
 
 def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
-           compress: bool = True) -> int:
+           force_restart: bool = False) -> int:
     """Scripts-menu entry: register, show the code, wait for a keypress, then act.
 
     A running daemon on the CURRENT version is NOT restarted by default (wasteful)
@@ -1058,6 +1021,9 @@ def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
     (different/missing recorded version, e.g. after a pixel.sh update), replace it
     so the new code actually takes effect — this is what makes a deployed update
     reach the long-poll, not a wasteful restart.
+
+    `force_restart=True` (the `--restart` CLI flag) skips the prompt and always
+    replaces any running daemon — for headless SSH use, where there's no menu.
     """
     running = isDaemonRunning(scriptDir=scriptDir)
     linked = bool(cfg.get("token"))
@@ -1068,7 +1034,8 @@ def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
     printReady(host=host, web_port=web_port, code=code, new_device=new_device,
                running=running, linked=linked)
 
-    choice = keyPrompt(running=running)
+    # --restart forces the "r" path (no key prompt); else ask interactively.
+    choice = "r" if force_restart else keyPrompt(running=running)
 
     if running and choice == "s":
         stopExistingDaemon(scriptDir=scriptDir)
@@ -1098,7 +1065,7 @@ def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
         stopExistingDaemon(scriptDir=scriptDir)
 
     return runAsDaemon(cfg=cfg, scriptDir=scriptDir, host=host, tcp_port=tcp_port,
-                       web_port=web_port, code=code, compress=compress)
+                       web_port=web_port, code=code)
 
 
 def fetchDeviceToken(host: str, web_port: int, device_id: str,
@@ -1122,7 +1089,7 @@ def fetchDeviceToken(host: str, web_port: int, device_id: str,
 
 
 def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
-               code: Optional[str] = None, compress: bool = True) -> None:
+               code: Optional[str] = None) -> None:
     """The detached poll loop: capture on web trigger, apply settings changes.
 
     Two phases, both keyed off this device's identity (never an account id):
@@ -1206,7 +1173,7 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
             continue
         metadata = buildMetadata(cfg=cfg, image=image)
         asyncio.run(main=sendImage(cfg=cfg, host=host, port=tcp_port, image=image,
-                                   metadata=metadata, compress=compress))
+                                   metadata=metadata))
         cleanupScreenshot(cfg=cfg, image=image)
 
 
@@ -1219,22 +1186,19 @@ if __name__ == "__main__":
     scriptDir = os.environ.get("PIXEL_SCRIPT_DIR") or os.path.dirname(p=os.path.abspath(path=__file__))
     cfg = loadConfig(scriptDir=scriptDir)
 
-    parser = argparse.ArgumentParser(description="Capture a MiSTer frame, save and/or send it for translation")
+    # PIXEL runs only as a daemon (capture is driven by the web "Translate now"
+    # trigger, and the device must be linked from the web before it can send).
+    # All capture/translation settings live server-side and arrive with each
+    # trigger — they are NOT settable here. The only knobs are: stop, restart, and
+    # an optional server override (otherwise CONF_SERVER from pixel.sh is used).
+    parser = argparse.ArgumentParser(
+        description="PIXEL — MiSTer frame-translation client daemon")
     parser.add_argument("-a", "--server-address", default=cfg["server"],
-                        help="Server as host[:port] (default from CONF_SERVER in pixel.sh)")
-    parser.add_argument("-s", "--save-path", default=None,
-                        help="Path to save the captured raw frame")
-    parser.add_argument("--game", default=None,
-                        help="Override the detected game title")
-    parser.add_argument("--no-compress", action="store_true",
-                        help="Send uncompressed RGB instead of zlib")
-    parser.add_argument("--once", action="store_true",
-                        help="Capture a single frame and send/save it, then exit "
-                             "(default is daemon mode)")
-    parser.add_argument("--save-only", action="store_true",
-                        help="With --once, only save locally (don't send to the server)")
+                        help="Server as host[:port], overriding CONF_SERVER in pixel.sh")
     parser.add_argument("--stop", action="store_true",
                         help="Stop the running PIXEL daemon and exit")
+    parser.add_argument("--restart", action="store_true",
+                        help="Restart the daemon (stop any running one, then start fresh)")
     args = parser.parse_args()
 
     # --stop: terminate the running daemon (if any) and exit. Explicit, safe
@@ -1246,55 +1210,13 @@ if __name__ == "__main__":
         print("PIXEL daemon stopped." if stopped else "No running PIXEL daemon found.")
         sys.exit(0)
 
-    if args.game:
-        cfg["game"] = args.game
-
-    # Default mode: the Scripts-menu launcher — register, show the pairing code +
-    # URL, wait for a keypress (R restart / S stop / any other key proceeds), then
-    # start or leave the daemon. One-shot capture is opt-in via --once (tests/debug).
-    if not args.once:
-        if not args.server_address:
-            print("No server configured: edit CONF_SERVER in pixel.sh or pass -a HOST[:PORT]")
-            sys.exit(1)
-        host, sep, port_str = args.server_address.partition(":")
-        tcp_port = int(port_str) if sep and port_str else DEFAULT_PORT
-        sys.exit(launch(cfg=cfg, scriptDir=scriptDir, host=host, tcp_port=tcp_port,
-                        web_port=cfg["web_port"], compress=not args.no_compress))
-
-    # --once: single capture. Sends to the server unless --save-only / -s only.
-    if not args.server_address and not args.save_path:
-        print("No action: specify --server-address (or edit CONF_SERVER in pixel.sh) and/or --save-path\n")
-        parser.print_help()
+    # Daemon mode (default + --restart): the Scripts-menu launcher registers, shows
+    # the pairing code + URL, and starts/leaves the daemon. --restart forces a clean
+    # stop+start with no key prompt (for headless SSH).
+    if not args.server_address:
+        print("No server configured: edit CONF_SERVER in pixel.sh or pass -a HOST[:PORT]")
         sys.exit(1)
-
-    try:
-        image = capture(cfg=cfg)
-    except Exception as e:
-        print(f"Capture failed: {e}")
-        sys.exit(1)
-    print(f"Captured: {image.width}x{image.height}, {len(image.data)} bytes "
-          f"({image.encoding})")
-
-    metadata = buildMetadata(cfg=cfg, image=image)
-    if metadata.get("core") or metadata.get("game"):
-        print(f"Context: core={metadata.get('core')} game={metadata.get('game')}")
-
-    if args.save_path:
-        saveCapture(image=image, filepath=args.save_path, metadata=metadata)
-
-    ok = True
-    do_send = args.server_address and not args.save_only
-    if do_send:
-        if not cfg.get("token"):
-            print("No device token: link this device from the web first "
-                  "(run PIXEL as a daemon and complete pairing).")
-            sys.exit(1)
-        # 3.9: str.partition is positional-only (it never accepted keywords)
-        host, sep, port_str = args.server_address.partition(":")
-        port = int(port_str) if sep and port_str else DEFAULT_PORT
-        ok = asyncio.run(main=sendImage(cfg=cfg, host=host, port=port, image=image,
-                                        metadata=metadata, compress=not args.no_compress))
-
-    cleanupScreenshot(cfg=cfg, image=image)
-    if do_send:
-        sys.exit(0 if ok else 1)
+    host, sep, port_str = args.server_address.partition(":")
+    tcp_port = int(port_str) if sep and port_str else DEFAULT_PORT
+    sys.exit(launch(cfg=cfg, scriptDir=scriptDir, host=host, tcp_port=tcp_port,
+                    web_port=cfg["web_port"], force_restart=args.restart))

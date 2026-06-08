@@ -1,6 +1,12 @@
 # MiSTer PIXEL — Client
 
-> **Translate retro game text on your MiSTer FPGA in real time.**
+**Translate retro game text on your MiSTer FPGA in real time.**
+
+> Almost all of the code was written by AI — not because I couldn’t write it myself or because I particularly enjoy using these tools, but simply because it would have taken time I didn’t have. Otherwise, this module wouldn’t exist at all.
+
+> Basically, without AI I wouldn’t have had the time to develop it the old-school way, especially since I’m not a JavaScript developer (the server this client connects to) and it would’ve taken me a bit longer…
+
+> That said, the structure, organization, integrations, and the setup for future development were all guided by me — as well as, of course, all the features it currently has.
 
 MiSTer PIXEL captures a screenshot from the game core currently running on your [MiSTer FPGA](https://github.com/MiSTer-devel/Main_MiSTer) and sends it to a companion server that performs OCR and translation via a VLM/AI model. The translated text is displayed on your phone or PC — no modification to the MiSTer firmware required.
 
@@ -59,18 +65,10 @@ MiSTer FPGA                          Your phone / PC
    ```bash
    scp pixel.sh root@<mister-ip>:/media/fat/Scripts/
    ```
-
-2. Edit the bootstrap constants at the top of `pixel.sh` to point at your server:
-
-   ```python
-   CONF_SERVER   = "192.168.1.10:9999"   # host[:port] of the PIXEL server
-   CONF_WEB_PORT = 8080                   # web UI port on the server
-   ```
-
    There is **no** separate config file to create and **no** API key: the client
    authenticates with a per-device token issued when you pair it from the web UI.
 
-3. Make the script executable:
+2. Make the script executable:
 
    ```bash
    chmod +x /media/fat/Scripts/pixel.sh
@@ -92,24 +90,23 @@ Select **pixel** from the OSD Scripts menu. A pairing code and URL are shown. Op
 
 ### Command line (SSH)
 
+PIXEL runs **only as a daemon** — capture is driven by the web "Translate now"
+button, and the device must be linked from the web area before it can send. All
+capture/translation settings live server-side (set them in the web Devices tab),
+so they are **not** command-line options. The only flags are:
+
 ```bash
-# Start daemon (default mode)
+# Start the daemon (default — same as the Scripts-menu entry)
 ./pixel.sh
 
-# Stop a running daemon
+# Restart it (stop any running daemon, then start fresh — no key prompt)
+./pixel.sh --restart
+
+# Stop the running daemon
 ./pixel.sh --stop
 
-# Single capture and send (debug / test)
-./pixel.sh --once -a 192.168.1.10:9999
-
-# Single capture, save locally only
-./pixel.sh --once --save-only -s /tmp/frame.raw
-
-# Override game title
-./pixel.sh --game "Final Fantasy VI"
-
-# Send without zlib compression
-./pixel.sh --once --no-compress -a 192.168.1.10:9999
+# Override the server host:port for this run (otherwise CONF_SERVER is used)
+./pixel.sh -a 192.168.1.10:9999
 ```
 
 ---
@@ -126,8 +123,8 @@ file and **no** API key.
 |----------|---------|
 | `CONF_SERVER` | Server as `host[:port]` |
 | `CONF_WEB_PORT` | Web UI port on the server (must match the server's `[web]` port) |
-| `CONF_CAPTURE_METHOD` | Fallback `fifo`/`mem` — only used by `--once`; daemon mode gets this from the server per trigger |
-| `CONF_DELETE_SCREENSHOT_AFTER` | Fallback for `--once` (same as above) |
+| `CONF_CAPTURE_METHOD` | Initial local default `fifo`/`mem` — the daemon gets the authoritative value from the server with each trigger |
+| `CONF_DELETE_SCREENSHOT_AFTER` | Initial local default (same as above) |
 
 ### Per-device settings *(web UI, server-side)*
 
@@ -165,14 +162,6 @@ Frames are sent over a raw TCP connection (little-endian):
 Payload is either **raw RGB zlib-compressed** (`image_encoding = "raw"`) or a **verbatim PNG** (`image_encoding = "png"`). The server decodes according to the `image_encoding` and `compression` fields in the metadata.
 
 The `protocol_version` field must match between client and server. Bump it whenever the wire format changes. Versions are managed via git tags.
-
----
-
-## Contributing
-
-Pull requests are welcome. Please keep the client dependency-free (stdlib only) and Python 3.9 compatible. Positional-only stdlib calls (e.g. `int.to_bytes`, `os.sysconf`) must remain positional — see the note at the top of `pixel.py`.
-
-Edit `pixel.py` (the source of truth), then run `./build.sh` to regenerate `pixel.sh` — the deployed wrapper embeds a verbatim copy of `pixel.py`, so the two must stay in sync (commit both).
 
 ---
 
