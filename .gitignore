@@ -5,6 +5,9 @@ pixel.log
 pixel.pid
 pixel.version
 
+# Local-only dev notes (kept in Italian, not published)
+instructions.md
+
 # Python
 .venv/
 __pycache__/
