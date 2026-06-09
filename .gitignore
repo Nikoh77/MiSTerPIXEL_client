@@ -5,6 +5,11 @@ pixel.log
 pixel.pid
 pixel.version
 
+# Generated artifact — built by CI from pixel.py and published as a Release
+# asset (not tracked here). Regenerate locally with ./build.sh if ever needed.
+pixel.sh
+pixel.sh.sha256
+
 # Local-only dev notes (kept in Italian, not published)
 instructions.md
 

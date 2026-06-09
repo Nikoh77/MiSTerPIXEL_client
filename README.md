@@ -60,9 +60,14 @@ MiSTer FPGA                          Your phone / PC
 
 ## Installation
 
-1. Copy `pixel.sh` to your MiSTer (e.g. `/media/fat/Scripts/`):
+1. Download the latest `pixel.sh` from the
+   [Releases page](https://github.com/Nikoh77/MiSTerPIXEL_client/releases/latest)
+   (it is built automatically from `pixel.py` and attached as a release asset —
+   it is **not** kept in the repo), then copy it to your MiSTer (e.g.
+   `/media/fat/Scripts/`):
 
    ```bash
+   curl -L -o pixel.sh https://github.com/Nikoh77/MiSTerPIXEL_client/releases/latest/download/pixel.sh
    scp pixel.sh root@<mister-ip>:/media/fat/Scripts/
    ```
    There is **no** separate config file to create and **no** API key: the client
