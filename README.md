@@ -14,6 +14,16 @@ This repository contains the **client** that runs on the MiSTer. The server comp
 
 ---
 
+## Free to use, open where it counts
+
+MiSTer PIXEL — the whole project, client **and** server — is **completely free to use**. It is **not**, however, **completely open source**: the server side stays closed.
+
+The **client** (this repository) is deliberately a different story. We release it as open source out of what feels like a moral obligation: the client is the **front door into your system**, so it should be perfectly transparent and auditable by anyone who wants to look.
+
+Here's the thing — on the MiSTer the client runs as **root**, exactly like every other script and executable on the device. So, in principle, it would be perfectly capable of making your MiSTer go up in smoke 😉. That's precisely why it seemed only fair to let anyone read every line and judge for themselves just how harmless it actually is — right down to how carefully it handles secret tokens and keys: credentials are never baked into URLs or logs, the per-device token is the only state kept on the device, and the bootstrap server address is never web-writable.
+
+---
+
 ## How it works
 
 ```
