@@ -2,6 +2,7 @@
 pixel_remote.ini
 pixel_token
 pixel.log
+pixel.log.*
 pixel.pid
 pixel.version
 

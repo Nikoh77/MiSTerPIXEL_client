@@ -30,7 +30,7 @@ import http.client
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, Tuple
 
-CLIENT_VERSION = "0.9.5"
+CLIENT_VERSION = "0.9.6"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
@@ -52,6 +52,7 @@ CONF_SERVER = "192.168.1.5"          # server as host[:port], e.g. "192.168.1.10
 CONF_WEB_PORT                = 8080          # web UI port on the server
 CONF_CAPTURE_METHOD          = "fifo"        # fallback "fifo" (firmware PNG) or "mem" (raw /dev/mem)
 CONF_DELETE_SCREENSHOT_AFTER = True          # fallback: delete firmware PNG after sending
+CONF_LOG_MAX_BYTES           = 10 * 1024 * 1024  # fallback: roll pixel.log past this size (10 MB)
 
 # --- Local files -----------------------------------------------------------
 # The client persists NO config file: bootstrap lives in the CONF_* constants
@@ -125,6 +126,7 @@ def defaultConfig() -> dict:
         "web_port":                CONF_WEB_PORT,
         "capture_method":          CONF_CAPTURE_METHOD,
         "delete_screenshot_after": CONF_DELETE_SCREENSHOT_AFTER,
+        "log_max_bytes":           CONF_LOG_MAX_BYTES,
         "token":                   None,   # per-device auth token (loaded from TOKEN_FILENAME)
     }
 
@@ -1088,6 +1090,69 @@ def fetchDeviceToken(host: str, web_port: int, device_id: str,
     return None
 
 
+def rotateLogIfNeeded(scriptDir: str, max_bytes: int) -> None:
+    """Size-cap the daemon log: when pixel.log reaches max_bytes, roll it over.
+
+    The detached daemon has stdout/stderr dup2'd onto pixel.log (see daemonize),
+    so the file would otherwise grow without bound. When it hits the limit we
+    rename it to pixel.log.1 (a single backup, replacing any previous one) and
+    REOPEN a fresh pixel.log, re-pointing fd 1/2 at it so logging keeps working
+    on the new file. Disk use stays bounded at ~2x max_bytes. max_bytes <= 0
+    disables rotation. Best-effort: never raises.
+    """
+    if not max_bytes or max_bytes <= 0:
+        return
+    path = os.path.join(scriptDir, LOG_FILENAME)
+    try:
+        if os.path.getsize(path) < max_bytes:
+            return
+    except OSError:
+        return  # no log yet / not stat-able
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        os.replace(path, path + ".1")          # current -> single backup
+    except OSError:
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(fd, 1)                          # re-point the daemon's stdout...
+        os.dup2(fd, 2)                          # ...and stderr at the fresh file
+        os.close(fd)
+    except OSError:
+        return
+    print(f"[{datetime.now().isoformat()}] log rotated (>= {max_bytes} B); "
+          f"previous kept as {LOG_FILENAME}.1", flush=True)
+
+
+def sendLog(host: str, web_port: int, token: str, scriptDir: str) -> None:
+    """Upload the current daemon log to the server on request (web-armed).
+
+    The server arms this like a trigger: a /api/wait response with `send_log`
+    true makes the daemon POST pixel.log to /api/log, authenticated with the
+    per-device token in the X-Pixel-Token header (so the server resolves which
+    device it is, and the secret stays out of the URL/logs). Lets you read a
+    device's log from the web with no SSH. Best-effort, never raises.
+    """
+    path = os.path.join(scriptDir, LOG_FILENAME)
+    try:
+        with open(file=path, mode="r", errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        content = f"(could not read {LOG_FILENAME}: {e})"
+    status, _ = httpRequest(host=host, port=web_port, method="POST",
+                            path="/api/log",
+                            body={"size": len(content), "log": content},
+                            headers={"X-Pixel-Token": token})
+    if status == 200:
+        print(f"Log uploaded to server ({len(content)} bytes).", flush=True)
+    else:
+        print(f"Log upload failed (status {status}).", flush=True)
+
+
 def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
                code: Optional[str] = None) -> None:
     """The detached poll loop: capture on web trigger, apply settings changes.
@@ -1109,6 +1174,10 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
         return
 
     while True:
+        # Size-cap the log every iteration; the check task's cadence is the poll
+        # loop itself, wired up here at daemon startup. Uses the server-provided
+        # limit once known, otherwise the CONF_LOG_MAX_BYTES default.
+        rotateLogIfNeeded(scriptDir=scriptDir, max_bytes=cfg.get("log_max_bytes", 0))
         token = cfg.get("token")
 
         # --- BOOTSTRAP: no token yet ---
@@ -1144,6 +1213,14 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
             cfg = loadConfig(scriptDir=scriptDir)
             continue
 
+        # Per-device settings can ride on ANY /api/wait response (not only a
+        # trigger): apply the log size cap as soon as the server sends it, so an
+        # idle daemon still rotates at the configured limit. Overrides the
+        # CONF_LOG_MAX_BYTES default; takes effect on the next iteration's check.
+        lmb = data.get("log_max_bytes")
+        if isinstance(lmb, (int, float)) and lmb > 0:
+            cfg["log_max_bytes"] = int(lmb)
+
         # Self-update (web-armed) takes priority over a capture. applyUpdate swaps
         # pixel.sh and spawns the new daemon, which SIGTERMs us; if it returns,
         # the update was refused/failed and we just keep polling on the old build.
@@ -1152,6 +1229,12 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
             applyUpdate(scriptDir=scriptDir, host=host, tcp_port=tcp_port,
                         version=upd.get("version", "?"), url=upd.get("url", ""),
                         sha256_expected=upd.get("sha256", ""))
+            continue
+
+        # Web-armed: upload the current log to the server (readable from the web,
+        # no SSH). Handled before a capture so a log request is never starved.
+        if data.get("send_log"):
+            sendLog(host=host, web_port=web_port, token=token, scriptDir=scriptDir)
             continue
 
         if not data.get("triggered"):
