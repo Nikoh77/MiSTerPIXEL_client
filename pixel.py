@@ -16,6 +16,7 @@ Design constraints:
   positionally even though the rest of the repo favors keyword arguments.
 """
 import os
+import re
 import sys
 import json
 import zlib
@@ -30,7 +31,7 @@ import http.client
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, Tuple
 
-CLIENT_VERSION = "0.9.6"
+CLIENT_VERSION = "0.9.7"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
@@ -84,6 +85,11 @@ CORENAME_PATH = "/tmp/CORENAME"
 # Main_MiSTer user_io.cpp.) PIXEL is self-contained: it relies only on stock
 # MiSTer files, never on third-party add-ons.
 GAMEID_PATH = "/tmp/GAMEID"
+# MiSTer's main config. `log_file_entry=1` (in the [MiSTer] section) makes Main
+# write /tmp/GAMEID — required for game identification. The web area can toggle
+# it via a SURGICAL edit (see setMisterLogging): nothing else in the file is ever
+# touched, with a one-deep backup + atomic replace.
+MISTER_INI_PATH = "/media/fat/MiSTer.ini"
 # Network interfaces, used to derive a stable per-device id (see detectDeviceId).
 NET_SYSFS_DIR = "/sys/class/net"
 
@@ -711,6 +717,147 @@ def applyUpdate(scriptDir: str, host: str, tcp_port: int, version: str,
               f"Restart PIXEL from the MiSTer menu to finish.", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# MiSTer.ini management (web-controlled log_file_entry) + remote reboot
+# ---------------------------------------------------------------------------
+# An active (non-comment) `log_file_entry = <n>` line. The value is captured so a
+# read returns it; the indentation is captured so a write preserves the layout.
+_LOG_KEY_RE = re.compile(r"^(\s*)log_file_entry\s*=\s*([0-9]+)", re.IGNORECASE)
+_SECTION_RE = re.compile(r"^\s*\[(.+?)\]\s*$")
+
+
+def _globalLogIndices(lines):
+    """Indices of ACTIVE log_file_entry lines in the global scope (the preamble
+    before any section + the [MiSTer] section). Comments are ignored. This is the
+    only scope MiSTer reads the option from, and the only one we ever edit."""
+    out = []
+    section = None                       # None = preamble (before first [section])
+    for i, ln in enumerate(lines):
+        sec = _SECTION_RE.match(ln)
+        if sec:
+            section = sec.group(1).strip().lower()
+            continue
+        stripped = ln.lstrip()
+        if stripped.startswith((";", "#")):
+            continue
+        if section in (None, "mister") and _LOG_KEY_RE.match(ln):
+            out.append(i)
+    return out
+
+
+def readMisterLogging(path: str = MISTER_INI_PATH) -> Optional[int]:
+    """Current log_file_entry value (0/1), or None if MiSTer.ini is unreadable.
+
+    Absent key -> 0 (MiSTer's default: logging off). Only the global scope is
+    considered (see _globalLogIndices); a later occurrence wins.
+    """
+    try:
+        with open(file=path, mode="r", errors="replace") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return None
+    idx = _globalLogIndices(lines)
+    if not idx:
+        return 0
+    m = _LOG_KEY_RE.match(lines[idx[-1]])
+    return int(m.group(2)) if m else 0
+
+
+def setMisterLogging(enabled: bool, path: str = MISTER_INI_PATH) -> bool:
+    """Set log_file_entry to 0/1 in MiSTer.ini with a SURGICAL, reversible edit.
+
+    Safety is the priority: we change/insert exactly ONE line, never reorder or
+    drop anything else, preserve the file's newline style, keep a one-deep
+    `.pixelbak`, and write atomically (tmp + os.replace). Refuses (returns False,
+    leaving the file untouched) on anything ambiguous: unreadable/empty file, or
+    more than one active key. Idempotent when already at the wanted value.
+    """
+    target = 1 if enabled else 0
+    try:
+        with open(file=path, mode="rb") as f:
+            raw = f.read()
+    except OSError as e:
+        print(f"[mister.ini] cannot read {path}: {e}", flush=True)
+        return False
+    if not raw.strip():
+        print(f"[mister.ini] refusing: {path} is empty/unreadable", flush=True)
+        return False
+
+    newline = "\r\n" if b"\r\n" in raw else "\n"
+    text = raw.decode("utf-8", "replace")
+    # Normalise to \n for processing, re-join with the detected newline at the end.
+    lines = text.replace("\r\n", "\n").split("\n")
+
+    idx = _globalLogIndices(lines)
+    if len(idx) > 1:
+        print("[mister.ini] refusing: multiple active log_file_entry lines", flush=True)
+        return False
+
+    new = list(lines)                     # copy: a single op below keeps it minimal
+    if idx:
+        j = idx[0]
+        indent = _LOG_KEY_RE.match(lines[j]).group(1)
+        new[j] = f"{indent}log_file_entry={target}"
+    else:
+        # No active key: insert after the [MiSTer] header, or create the section.
+        header = next((i for i, ln in enumerate(lines)
+                       if _SECTION_RE.match(ln)
+                       and _SECTION_RE.match(ln).group(1).strip().lower() == "mister"),
+                      None)
+        if header is not None:
+            new.insert(header + 1, f"log_file_entry={target}")
+        else:
+            if new and new[-1].strip() != "":
+                new.append("")
+            new.append("[MiSTer]")
+            new.append(f"log_file_entry={target}")
+
+    new_text = newline.join(new)
+    if new_text == text:
+        return True                       # already at the wanted value
+
+    # Sanity guard: we only ever changed/added log_file_entry / a [MiSTer] header.
+    removed = [l for l in lines if l not in new]
+    added = [l for l in new if l not in lines]
+    if any("log_file_entry" not in l and l.strip().lower() != "[mister]" and l.strip() != ""
+           for l in removed + added):
+        print("[mister.ini] refusing: edit would change unrelated lines", flush=True)
+        return False
+
+    try:
+        with open(file=path + ".pixelbak", mode="wb") as b:
+            b.write(raw)                  # one-deep backup for manual rollback
+        tmp = path + ".pixeltmp"
+        with open(file=tmp, mode="w", newline="") as f:
+            f.write(new_text)
+        os.replace(tmp, path)             # atomic on the same filesystem
+        print(f"[mister.ini] log_file_entry set to {target}", flush=True)
+        return True
+    except OSError as e:
+        print(f"[mister.ini] write failed: {e}", flush=True)
+        try:
+            os.remove(path + ".pixeltmp")
+        except OSError:
+            pass
+        return False
+
+
+def rebootMister() -> None:
+    """Reboot the MiSTer (the daemon runs as root). Flushes disk first; detached
+    so this process can be replaced cleanly. Best-effort, never raises."""
+    print("[reboot] rebooting MiSTer on web request...", flush=True)
+    try:
+        os.sync()
+    except OSError:
+        pass
+    try:
+        subprocess.Popen(["reboot"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True)
+    except OSError as e:
+        print(f"[reboot] failed: {e}", flush=True)
+
+
 def registerClient(cfg: dict, host: str, web_port: int
                    ) -> tuple:  # (code: Optional[str], new_device: bool)
     """Register this client with the server; return (code, new_device).
@@ -1173,6 +1320,10 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
               "Daemon exiting.", flush=True)
         return
 
+    # Current MiSTer.ini log_file_entry status, reported on every linked poll so
+    # the web Devices toggle stays fresh. Re-read after we apply a change.
+    mister_logging = readMisterLogging()
+
     while True:
         # Size-cap the log every iteration; the check task's cadence is the poll
         # loop itself, wired up here at daemon startup. Uses the server-provided
@@ -1200,8 +1351,13 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
             continue  # still unlinked, or just acquired the token: re-poll
 
         # --- LINKED: authenticate with the per-device token ---
+        # Report the MiSTer.ini log_file_entry status (non-secret) so the web
+        # Devices toggle reflects reality, including manual edits.
+        wait_path = "/api/wait"
+        if mister_logging in (0, 1):
+            wait_path = f"/api/wait?log_file_entry={mister_logging}"
         status, data = httpRequest(host=host, port=web_port, method="GET",
-                                   path="/api/wait", timeout=40.0,
+                                   path=wait_path, timeout=40.0,
                                    headers={"X-Pixel-Token": token})
         if status == -1:
             time.sleep(3)
@@ -1229,6 +1385,23 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
             applyUpdate(scriptDir=scriptDir, host=host, tcp_port=tcp_port,
                         version=upd.get("version", "?"), url=upd.get("url", ""),
                         sha256_expected=upd.get("sha256", ""))
+            continue
+
+        # Web-armed reboot: the daemon stops with the reboot; PIXEL must be
+        # relaunched from the MiSTer Scripts menu afterwards (it's not a boot
+        # service). Handled before a capture.
+        if data.get("reboot"):
+            rebootMister()
+            continue
+
+        # Web-armed MiSTer.ini change (e.g. enabling log_file_entry for game
+        # identification): apply the surgical edit, then refresh the reported
+        # status so the next poll shows the new value.
+        mi = data.get("set_mister_ini")
+        if isinstance(mi, dict):
+            if "log_file_entry" in mi:
+                setMisterLogging(enabled=bool(mi["log_file_entry"]))
+                mister_logging = readMisterLogging()
             continue
 
         # Web-armed: upload the current log to the server (readable from the web,
