@@ -29,9 +29,9 @@ import argparse
 import subprocess
 import http.client
 from datetime import datetime, timezone
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional, TextIO, Tuple, cast
 
-CLIENT_VERSION = "0.9.7"
+CLIENT_VERSION = "0.9.8"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
@@ -796,14 +796,21 @@ def setMisterLogging(enabled: bool, path: str = MISTER_INI_PATH) -> bool:
     new = list(lines)                     # copy: a single op below keeps it minimal
     if idx:
         j = idx[0]
-        indent = _LOG_KEY_RE.match(lines[j]).group(1)
+        m = _LOG_KEY_RE.match(lines[j])
+        assert m
+        indent = m.group(1)
         new[j] = f"{indent}log_file_entry={target}"
     else:
         # No active key: insert after the [MiSTer] header, or create the section.
-        header = next((i for i, ln in enumerate(lines)
-                       if _SECTION_RE.match(ln)
-                       and _SECTION_RE.match(ln).group(1).strip().lower() == "mister"),
-                      None)
+        header = next(
+            (
+                i
+                for i, ln in enumerate(lines)
+                if (sm := _SECTION_RE.match(ln))
+                and sm.group(1).strip().lower() == "mister"
+            ),
+            None,
+        )
         if header is not None:
             new.insert(header + 1, f"log_file_entry={target}")
         else:
@@ -1170,8 +1177,8 @@ def daemonize(scriptDir: str) -> bool:
     os.close(logfd)
     # Timestamp every log line (survives log rotation: it re-dup2s fd 1/2, while
     # these wrappers keep writing through the same sys.stdout/err objects).
-    sys.stdout = _TimestampStream(sys.stdout)
-    sys.stderr = _TimestampStream(sys.stderr)
+    sys.stdout = cast(TextIO, _TimestampStream(sys.stdout))
+    sys.stderr = cast(TextIO, _TimestampStream(sys.stderr))
     return True
 
 
