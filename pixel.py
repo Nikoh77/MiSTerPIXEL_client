@@ -1094,6 +1094,52 @@ def installShutdownHandler(scriptDir: str) -> None:
     signal.signal(signal.SIGINT, handler)
 
 
+class _TimestampStream:
+    """Wrap a text stream to prefix every line with a local timestamp.
+
+    The daemon logs with plain print() to stdout/stderr (dup2'd onto pixel.log);
+    wrapping the streams stamps each line — `[YYYY-MM-DD HH:MM:SS] msg` — without
+    touching the call sites. State across writes tracks line starts (print emits
+    the message and the newline in separate writes); blank lines aren't stamped.
+    """
+
+    def __init__(self, raw) -> None:
+        self._raw = raw
+        self._line_start = True
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        stamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
+        out = []
+        s = text
+        while s:
+            nl = s.find("\n")
+            if nl < 0:                       # no newline: rest of the line
+                if self._line_start and s:
+                    out.append(stamp)
+                    self._line_start = False
+                out.append(s)
+                s = ""
+            else:                            # up to and including the newline
+                if self._line_start and nl > 0:
+                    out.append(stamp)
+                out.append(s[:nl + 1])
+                self._line_start = True
+                s = s[nl + 1:]
+        self._raw.write("".join(out))
+        return len(text)
+
+    def flush(self) -> None:
+        self._raw.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        return self._raw.fileno()
+
+
 def daemonize(scriptDir: str) -> bool:
     """Detach the current process from the terminal (double-fork + setsid).
 
@@ -1122,6 +1168,10 @@ def daemonize(scriptDir: str) -> bool:
     os.dup2(logfd, 2)
     os.close(devnull)
     os.close(logfd)
+    # Timestamp every log line (survives log rotation: it re-dup2s fd 1/2, while
+    # these wrappers keep writing through the same sys.stdout/err objects).
+    sys.stdout = _TimestampStream(sys.stdout)
+    sys.stderr = _TimestampStream(sys.stderr)
     return True
 
 
