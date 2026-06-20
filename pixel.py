@@ -31,7 +31,7 @@ import http.client
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, TextIO, Tuple, cast
 
-CLIENT_VERSION = "1.0.3"
+CLIENT_VERSION = "1.0.4"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
@@ -893,7 +893,14 @@ def registerClient(cfg: dict, web_host: str, web_port: int, web_tls: bool
                                method="POST", path="/api/register", body=body)
     if status == 200 and data.get("code"):
         return data["code"], data.get("new_device", False)
-    print(f"Registration failed (status {status}).")
+    if status == -1:
+        pass  # httpRequest already printed the specific transport error
+    elif status in (502, 503, 504):
+        print(f"Server {web_host} is temporarily unavailable (HTTP {status}) "
+              "— it may be down or restarting, try again shortly.")
+    else:
+        detail = f": {data['error']}" if data.get("error") else ""
+        print(f"Registration failed (status {status}){detail}.")
     return None, False
 
 
