@@ -31,7 +31,7 @@ import http.client
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, TextIO, Tuple, cast
 
-CLIENT_VERSION = "1.0.0"
+CLIENT_VERSION = "1.0.1"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
@@ -39,7 +39,7 @@ MISTER_SCALER_BUFFERSIZE = 0x1000000  # 16MB
 
 # --- Protocol / client identity --------------------------------------------
 PROTOCOL_VERSION = 3  # bump whenever the wire format changes (server must match)
-DEFAULT_PORT = 49212
+DEFAULT_PORT = 49215
 
 # ---------------------------------------------------------------------------
 # Bootstrap settings — edit these constants before deploying to your MiSTer.
