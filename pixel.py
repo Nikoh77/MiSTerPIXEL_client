@@ -31,7 +31,7 @@ import http.client
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, TextIO, Tuple, cast
 
-CLIENT_VERSION = "0.9.8"
+CLIENT_VERSION = "0.9.9"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
@@ -49,7 +49,7 @@ DEFAULT_PORT = 9999
 # Translation language lives server-side too (set it from the web Devices tab), so
 # the client never sends it. No config file is written on the device.
 # ---------------------------------------------------------------------------
-CONF_SERVER = "192.168.1.5"          # server as host[:port], e.g. "192.168.1.10:9999"
+CONF_SERVER = "app.misterpixel.org"          # server as host[:port], e.g. "192.168.1.10:9999"
 CONF_WEB_PORT                = 8080          # web UI port on the server
 CONF_CAPTURE_METHOD          = "fifo"        # fallback "fifo" (firmware PNG) or "mem" (raw /dev/mem)
 CONF_DELETE_SCREENSHOT_AFTER = True          # fallback: delete firmware PNG after sending
