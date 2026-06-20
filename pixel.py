@@ -31,7 +31,7 @@ import http.client
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, TextIO, Tuple, cast
 
-CLIENT_VERSION = "1.0.1"
+CLIENT_VERSION = "1.0.2"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
@@ -43,14 +43,20 @@ DEFAULT_PORT = 49215
 
 # ---------------------------------------------------------------------------
 # Bootstrap settings — edit these constants before deploying to your MiSTer.
-# server/web_port are the only thing the client truly needs to know. The capture
+# The two server endpoints are the only thing the client truly needs to know:
+# CONF_SERVER (raw-TCP frame channel, no TLS) and CONF_WEB_HOST/PORT (HTTPS
+# web+API). They can be the SAME host or different — e.g. one day the frames can
+# point at a dedicated inference VPS while the web stays elsewhere, with no code
+# change. The capture
 # constants are just the initial local defaults: in daemon mode the authoritative
 # per-device capture settings arrive with each trigger from the server.
 # Translation language lives server-side too (set it from the web Devices tab), so
 # the client never sends it. No config file is written on the device.
 # ---------------------------------------------------------------------------
-CONF_SERVER = "app.misterpixel.org"          # server as host[:port], e.g. "192.168.1.10:9999"
-CONF_WEB_PORT                = 57621         # web UI port on the server
+CONF_SERVER   = "app.misterpixel.org"        # FRAME channel: host[:port], raw TCP (no TLS; port -> DEFAULT_PORT)
+CONF_WEB_HOST = "www.misterpixel.org"        # WEB+API host (register, /api/wait, token, log) — may differ from above
+CONF_WEB_PORT = 443                          # WEB+API port
+CONF_WEB_TLS  = True                         # WEB+API over HTTPS (set False only for plain-HTTP local dev)
 CONF_CAPTURE_METHOD          = "fifo"        # fallback "fifo" (firmware PNG) or "mem" (raw /dev/mem)
 CONF_DELETE_SCREENSHOT_AFTER = True          # fallback: delete firmware PNG after sending
 CONF_LOG_MAX_BYTES           = 10 * 1024 * 1024  # fallback: roll pixel.log past this size (10 MB)
@@ -129,7 +135,9 @@ def defaultConfig() -> dict:
     """Return a fresh cfg dict built from the built-in user constants (CONF_*)."""
     return {
         "server":                  CONF_SERVER,
+        "web_host":                CONF_WEB_HOST,
         "web_port":                CONF_WEB_PORT,
+        "web_tls":                 CONF_WEB_TLS,
         "capture_method":          CONF_CAPTURE_METHOD,
         "delete_screenshot_after": CONF_DELETE_SCREENSHOT_AFTER,
         "log_max_bytes":           CONF_LOG_MAX_BYTES,
@@ -579,19 +587,24 @@ async def sendImage(cfg: dict, host: str, port: int, image: CapturedImage,
 
 def httpRequest(host: str, port: int, method: str, path: str,
                 body: Optional[dict] = None, timeout: float = 35.0,
-                headers: Optional[dict] = None) -> Tuple[int, dict]:
-    """Make one HTTP request to the server and return (status, json_dict).
+                headers: Optional[dict] = None,
+                tls: bool = True) -> Tuple[int, dict]:
+    """Make one HTTP(S) request to the web/API server and return (status, json_dict).
 
-    stdlib-only (http.client), so the client stays Nuitka-friendly. Returns
-    (-1, {}) on a connection/transport error rather than raising. `headers`
-    carries secrets (e.g. the device token) so they stay out of the URL/logs.
+    stdlib-only (http.client), so the client stays Nuitka-friendly. `tls=True`
+    (the default) uses HTTPS with the system CA bundle verifying the certificate
+    (the same path the self-update uses for GitHub, so it works on the MiSTer);
+    set tls=False only for a plain-HTTP local server. Returns (-1, {}) on a
+    connection/transport error rather than raising. `headers` carries secrets
+    (e.g. the device token) so they stay out of the URL/logs.
     """
     data = None
     headers = dict(headers) if headers else {}
     if body is not None:
         data = json.dumps(obj=body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    conn = (http.client.HTTPSConnection(host, port, timeout=timeout) if tls
+            else http.client.HTTPConnection(host, port, timeout=timeout))
     try:
         conn.request(method, path, body=data, headers=headers)
         resp = conn.getresponse()
@@ -865,7 +878,7 @@ def rebootMister() -> None:
         print(f"[reboot] failed: {e}", flush=True)
 
 
-def registerClient(cfg: dict, host: str, web_port: int
+def registerClient(cfg: dict, web_host: str, web_port: int, web_tls: bool
                    ) -> tuple:  # (code: Optional[str], new_device: bool)
     """Register this client with the server; return (code, new_device).
 
@@ -876,8 +889,8 @@ def registerClient(cfg: dict, host: str, web_port: int
     """
     body = {"device_id": detectDeviceId(),
             "client_version": CLIENT_VERSION}
-    status, data = httpRequest(host=host, port=web_port, method="POST",
-                               path="/api/register", body=body)
+    status, data = httpRequest(host=web_host, port=web_port, tls=web_tls,
+                               method="POST", path="/api/register", body=body)
     if status == 200 and data.get("code"):
         return data["code"], data.get("new_device", False)
     print(f"Registration failed (status {status}).")
@@ -1182,12 +1195,15 @@ def daemonize(scriptDir: str) -> bool:
     return True
 
 
-def printReady(host: str, web_port: int, code: str, new_device: bool,
-               running: bool, linked: bool) -> None:
+def printReady(web_host: str, web_port: int, web_tls: bool, code: str,
+               new_device: bool, running: bool, linked: bool) -> None:
     """Print the 'PIXEL is ready' banner with the pairing code + URL."""
+    scheme = "https" if web_tls else "http"
+    default_port = 443 if web_tls else 80
+    netloc = web_host if web_port == default_port else f"{web_host}:{web_port}"
     print("=" * 44)
     print("  PIXEL is ready.")
-    print(f"  On your phone/PC open:  http://{host}:{web_port}")
+    print(f"  On your phone/PC open:  {scheme}://{netloc}")
     print(f"  Enter this code:        {code}")
     if new_device:
         print("  New device — complete registration in your browser.")
@@ -1196,8 +1212,8 @@ def printReady(host: str, web_port: int, code: str, new_device: bool,
     print("=" * 44)
 
 
-def runAsDaemon(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
-                code: str) -> int:
+def runAsDaemon(cfg: dict, scriptDir: str, host: str, tcp_port: int,
+                web_host: str, web_port: int, web_tls: bool, code: str) -> int:
     """Detach into the background and run the poll loop (become THE daemon).
 
     The parent exits so the MiSTer Scripts menu returns to the OSD; the detached
@@ -1211,11 +1227,12 @@ def runAsDaemon(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: i
     print(f"[{datetime.now().isoformat()}] PIXEL daemon started (code {code}).",
           flush=True)
     daemonLoop(cfg=cfg, scriptDir=scriptDir, host=host, tcp_port=tcp_port,
-               web_port=web_port, code=code)
+               web_host=web_host, web_port=web_port, web_tls=web_tls, code=code)
     return 0
 
 
-def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
+def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int,
+           web_host: str, web_port: int, web_tls: bool,
            force_restart: bool = False) -> int:
     """Scripts-menu entry: register, show the code, wait for a keypress, then act.
 
@@ -1234,11 +1251,12 @@ def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
     running = isDaemonRunning(scriptDir=scriptDir)
     linked = bool(cfg.get("token"))
 
-    code, new_device = registerClient(cfg=cfg, host=host, web_port=web_port)
+    code, new_device = registerClient(cfg=cfg, web_host=web_host,
+                                      web_port=web_port, web_tls=web_tls)
     if not code:
         return 1
-    printReady(host=host, web_port=web_port, code=code, new_device=new_device,
-               running=running, linked=linked)
+    printReady(web_host=web_host, web_port=web_port, web_tls=web_tls, code=code,
+               new_device=new_device, running=running, linked=linked)
 
     # --restart forces the "r" path (no key prompt); else ask interactively.
     choice = "r" if force_restart else keyPrompt(running=running)
@@ -1271,10 +1289,10 @@ def launch(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
         stopExistingDaemon(scriptDir=scriptDir)
 
     return runAsDaemon(cfg=cfg, scriptDir=scriptDir, host=host, tcp_port=tcp_port,
-                       web_port=web_port, code=code)
+                       web_host=web_host, web_port=web_port, web_tls=web_tls, code=code)
 
 
-def fetchDeviceToken(host: str, web_port: int, device_id: str,
+def fetchDeviceToken(web_host: str, web_port: int, web_tls: bool, device_id: str,
                      code: Optional[str]) -> Optional[str]:
     """Exchange the pairing code for this device's auth token (once linked).
 
@@ -1285,8 +1303,8 @@ def fetchDeviceToken(host: str, web_port: int, device_id: str,
     if not code:
         print("Cannot fetch token: no pairing code available.", flush=True)
         return None
-    status, data = httpRequest(host=host, port=web_port, method="POST",
-                               path="/api/device-token",
+    status, data = httpRequest(host=web_host, port=web_port, tls=web_tls,
+                               method="POST", path="/api/device-token",
                                body={"device_id": device_id, "code": code})
     if status == 200 and data.get("token"):
         return data["token"]
@@ -1332,7 +1350,7 @@ def rotateLogIfNeeded(scriptDir: str, max_bytes: int) -> None:
           f"previous kept as {LOG_FILENAME}.1", flush=True)
 
 
-def sendLog(host: str, web_port: int, token: str, scriptDir: str) -> None:
+def sendLog(web_host: str, web_port: int, web_tls: bool, token: str, scriptDir: str) -> None:
     """Upload the current daemon log to the server on request (web-armed).
 
     The server arms this like a trigger: a /api/wait response with `send_log`
@@ -1347,8 +1365,8 @@ def sendLog(host: str, web_port: int, token: str, scriptDir: str) -> None:
             content = f.read()
     except OSError as e:
         content = f"(could not read {LOG_FILENAME}: {e})"
-    status, _ = httpRequest(host=host, port=web_port, method="POST",
-                            path="/api/log",
+    status, _ = httpRequest(host=web_host, port=web_port, tls=web_tls,
+                            method="POST", path="/api/log",
                             body={"size": len(content), "log": content},
                             headers={"X-Pixel-Token": token})
     if status == 200:
@@ -1357,7 +1375,8 @@ def sendLog(host: str, web_port: int, token: str, scriptDir: str) -> None:
         print(f"Log upload failed (status {status}).", flush=True)
 
 
-def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: int,
+def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int,
+               web_host: str, web_port: int, web_tls: bool,
                code: Optional[str] = None) -> None:
     """The detached poll loop: capture on web trigger, apply settings changes.
 
@@ -1390,14 +1409,15 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
 
         # --- BOOTSTRAP: no token yet ---
         if not token:
-            status, data = httpRequest(host=host, port=web_port, method="GET",
+            status, data = httpRequest(host=web_host, port=web_port, tls=web_tls,
+                                       method="GET",
                                        path=f"/api/wait?device_id={device_id}", timeout=40.0)
             if status == -1:
                 time.sleep(3)
                 continue
             if data.get("linked"):
-                new_token = fetchDeviceToken(host=host, web_port=web_port,
-                                             device_id=device_id, code=code)
+                new_token = fetchDeviceToken(web_host=web_host, web_port=web_port,
+                                             web_tls=web_tls, device_id=device_id, code=code)
                 if new_token and saveToken(scriptDir=scriptDir, token=new_token):
                     cfg = loadConfig(scriptDir=scriptDir)
                     print("Device linked — secure token stored.", flush=True)
@@ -1413,8 +1433,8 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
         wait_path = "/api/wait"
         if mister_logging in (0, 1):
             wait_path = f"/api/wait?log_file_entry={mister_logging}"
-        status, data = httpRequest(host=host, port=web_port, method="GET",
-                                   path=wait_path, timeout=40.0,
+        status, data = httpRequest(host=web_host, port=web_port, tls=web_tls,
+                                   method="GET", path=wait_path, timeout=40.0,
                                    headers={"X-Pixel-Token": token})
         if status == -1:
             time.sleep(3)
@@ -1464,7 +1484,8 @@ def daemonLoop(cfg: dict, scriptDir: str, host: str, tcp_port: int, web_port: in
         # Web-armed: upload the current log to the server (readable from the web,
         # no SSH). Handled before a capture so a log request is never starved.
         if data.get("send_log"):
-            sendLog(host=host, web_port=web_port, token=token, scriptDir=scriptDir)
+            sendLog(web_host=web_host, web_port=web_port, web_tls=web_tls,
+                    token=token, scriptDir=scriptDir)
             continue
 
         if not data.get("triggered"):
@@ -1532,4 +1553,5 @@ if __name__ == "__main__":
     host, sep, port_str = args.server_address.partition(":")
     tcp_port = int(port_str) if sep and port_str else DEFAULT_PORT
     sys.exit(launch(cfg=cfg, scriptDir=scriptDir, host=host, tcp_port=tcp_port,
-                    web_port=cfg["web_port"], force_restart=args.restart))
+                    web_host=cfg["web_host"], web_port=cfg["web_port"],
+                    web_tls=cfg["web_tls"], force_restart=args.restart))
