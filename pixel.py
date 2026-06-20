@@ -31,7 +31,7 @@ import http.client
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional, TextIO, Tuple, cast
 
-CLIENT_VERSION = "0.9.9"
+CLIENT_VERSION = "1.0.0"
 
 # --- Constants from the C++ code (shmem.h) ---------------------------------
 MISTER_SCALER_BASEADDR = 0x20000000
@@ -39,7 +39,7 @@ MISTER_SCALER_BUFFERSIZE = 0x1000000  # 16MB
 
 # --- Protocol / client identity --------------------------------------------
 PROTOCOL_VERSION = 3  # bump whenever the wire format changes (server must match)
-DEFAULT_PORT = 9999
+DEFAULT_PORT = 49212
 
 # ---------------------------------------------------------------------------
 # Bootstrap settings — edit these constants before deploying to your MiSTer.
@@ -50,7 +50,7 @@ DEFAULT_PORT = 9999
 # the client never sends it. No config file is written on the device.
 # ---------------------------------------------------------------------------
 CONF_SERVER = "app.misterpixel.org"          # server as host[:port], e.g. "192.168.1.10:9999"
-CONF_WEB_PORT                = 8080          # web UI port on the server
+CONF_WEB_PORT                = 57621         # web UI port on the server
 CONF_CAPTURE_METHOD          = "fifo"        # fallback "fifo" (firmware PNG) or "mem" (raw /dev/mem)
 CONF_DELETE_SCREENSHOT_AFTER = True          # fallback: delete firmware PNG after sending
 CONF_LOG_MAX_BYTES           = 10 * 1024 * 1024  # fallback: roll pixel.log past this size (10 MB)
